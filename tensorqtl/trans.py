@@ -41,9 +41,7 @@ def filter_cis(pairs_df, phenotype_pos_df, variant_df, window=5000000):
     """
     pos_dict = phenotype_pos_df.T.to_dict()
     variant_df = variant_df.loc[pairs_df['variant_id'].unique()].copy()
-    variant_dict = {}
-    for variant_id, chrom, pos in zip(variant_df.index, variant_df['chrom'], variant_df['pos']):
-        variant_dict[variant_id] = {'chrom':chrom, 'pos':pos}
+    variant_dict = {v:{'chrom':c, 'pos':p} for v,c,p in zip(variant_df.index, variant_df['chrom'], variant_df['pos'])}
 
     drop_ix = []
     for k,gene_id,variant_id in zip(pairs_df['phenotype_id'].index, pairs_df['phenotype_id'], pairs_df['variant_id']):
@@ -152,7 +150,7 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
         del residualizer
 
         if maf_threshold > 0:
-            logger.write(f'  * {n_variants} variants passed MAF >= {maf_threshold:.2f} filtering')
+            logger.write(f'  * {n_variants} variants passed MAF >= {maf_threshold} filtering')
 
         # post-processing: concatenate batches
         if return_sparse:
@@ -375,7 +373,7 @@ def map_permutations(genotype_df, covariates_df, permutations=None,
             chr_max_r2[chrom] = max_r2_t.cpu()
         logger.write(f'    time elapsed: {(time.time()-start_time)/60:.2f} min')
         if maf_threshold > 0:
-            logger.write(f'  * {n_variants} variants passed MAF >= {maf_threshold:.2f} filtering')
+            logger.write(f'  * {n_variants} variants passed MAF >= {maf_threshold} filtering')
         chr_max_r2 = pd.DataFrame(chr_max_r2)
 
         # leave-one-out max
@@ -422,7 +420,7 @@ def map_permutations(genotype_df, covariates_df, permutations=None,
             max_r2_t = torch.max(m, max_r2_t)
         logger.write(f'    time elapsed: {(time.time()-start_time)/60:.2f} min')
         if maf_threshold > 0:
-            logger.write(f'  * {n_variants} variants passed MAF >= {maf_threshold:.2f} filtering')
+            logger.write(f'  * {n_variants} variants passed MAF >= {maf_threshold} filtering')
         max_r2 = max_r2_t.cpu().numpy().astype(np.float64)
         tstat = np.sqrt( dof*max_r2 / (1-max_r2) )
         minp_empirical = 2*stats.t.cdf(-np.abs(tstat), dof)

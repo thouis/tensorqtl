@@ -172,7 +172,7 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
         assert interaction_df.index.equals(phenotype_df.columns)
         logger.write(f"  * including {interaction_df.shape[1]} interaction term(s)")
         if maf_threshold_interaction > 0:
-            logger.write(f'    * using {maf_threshold_interaction:.2f} MAF threshold')
+            logger.write(f'    * using {maf_threshold_interaction} MAF threshold')
     elif maf_threshold > 0:
         logger.write(f'  * applying in-sample {maf_threshold} MAF filter')
     logger.write(f'  * cis-window: ±{window:,}')
@@ -563,7 +563,7 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
 def prepare_cis_output(r_nominal, r2_perm, std_ratio, g, num_var, dof, variant_id, start_distance, end_distance, phenotype_id, nperm=10000):
     """Return nominal p-value, allele frequencies, etc. as pd.Series"""
     r2_nominal = r_nominal*r_nominal
-    pval_perm = (np.sum(r2_perm>=r2_nominal)+1) / (nperm+1)
+    pval_perm = (np.sum(r2_perm >= r2_nominal)+1) / (nperm+1)
 
     slope = r_nominal * std_ratio
     tstat2 = dof * r2_nominal / (1 - r2_nominal)
@@ -780,8 +780,8 @@ def map_cis(genotype_df, variant_df, phenotype_df, phenotype_pos_df, covariates_
 
 
 def map_independent(genotype_df, variant_df, cis_df, phenotype_df, phenotype_pos_df, covariates_df,
-                    group_s=None, maf_threshold=0, fdr=0.05, fdr_col='qval', nperm=10000,
-                    window=1000000, random_tiebreak=False, logger=None, seed=None, verbose=True):
+                    group_s=None, maf_threshold=0, fdr=0.05, fdr_col='qval', nperm=10000, window=1000000,
+                    missing=-9, random_tiebreak=False, logger=None, seed=None, verbose=True):
     """
     Run independent cis-QTL mapping (forward-backward regression)
 
@@ -871,7 +871,7 @@ def map_independent(genotype_df, variant_df, cis_df, phenotype_df, phenotype_pos
                 # add variant to covariates
                 variant_id = forward_df[-1]['variant_id']
                 ig = genotype_df.values[ix_dict[variant_id], genotype_ix].copy()
-                m = ig == -1
+                m = ig == missing
                 ig[m] = ig[~m].mean()
                 dosage_dict[variant_id] = ig
                 covariates = np.hstack([covariates, ig.reshape(-1,1)]).astype(np.float32)
@@ -945,14 +945,14 @@ def map_independent(genotype_df, variant_df, cis_df, phenotype_df, phenotype_pos
                 genotype_range = genotype_range[mask]
 
             # 1) forward pass
-            forward_df = [signif_df[signif_df['group_id']==group_id].iloc[0]]  # initialize results with top variant
+            forward_df = [signif_df[signif_df['group_id'] == group_id].iloc[0]]  # initialize results with top variant
             covariates = covariates_df.values.copy()  # initialize covariates
             dosage_dict = {}
             while True:
                 # add variant to covariates
                 variant_id = forward_df[-1]['variant_id']
                 ig = genotype_df.values[ix_dict[variant_id], genotype_ix].copy()
-                m = ig == -1
+                m = ig == missing
                 ig[m] = ig[~m].mean()
                 dosage_dict[variant_id] = ig
                 covariates = np.hstack([covariates, ig.reshape(-1,1)]).astype(np.float32)

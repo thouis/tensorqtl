@@ -18,7 +18,9 @@ def read_pvar(pvar_path):
 
 def read_psam(psam_path):
     """Read psam file as pd.DataFrame"""
-    return pd.read_csv(psam_path, sep='\t', index_col=0)
+    psam_df = pd.read_csv(psam_path, sep='\t', index_col=0)
+    psam_df.index = psam_df.index.astype(str)
+    return psam_df
 
 
 def hardcall_phase_present(pgen_path):
@@ -338,6 +340,7 @@ class PgenReader(object):
 
         variant_df = self.pvar_df.set_index('id')[['chrom', 'pos']]
         variant_df['index'] = np.arange(variant_df.shape[0])
+        self.variant_df = variant_df
         self.variant_dfs = {c:g[['pos', 'index']] for c,g in variant_df.groupby('chrom', sort=False)}
 
     def set_samples(self, sample_ids=None, sort=True):
@@ -490,37 +493,50 @@ class PgenReader(object):
         """Load all alleles."""
         return self.read_alleles_range(0, self.num_variants-1)
 
-    def get_pairwise_ld(self, id1, id2, dtype=np.float32):
+    def get_pairwise_ld(self, id1, id2, r2=True, dtype=np.float32):
         """Compute pairwise LD (R2) between (lists of) variants"""
         if isinstance(id1, str) and isinstance(id2, str):
             g1 = self.read(id1, dtype=dtype)
             g2 = self.read(id2, dtype=dtype)
             g1 -= g1.mean()
             g2 -= g2.mean()
-            return (g1 * g2).sum()**2 / ( (g1**2).sum() * (g2**2).sum() )
+            if r2:
+                r = (g1 * g2).sum()**2 / ( (g1**2).sum() * (g2**2).sum() )
+            else:
+                r = (g1 * g2).sum() / np.sqrt( (g1**2).sum() * (g2**2).sum() )
         elif isinstance(id1, str):
             g1 = self.read(id1, dtype=dtype)
             g2 = self.read_list(id2, dtype=dtype)
             g1 -= g1.mean()
             g2 -= g2.values.mean(1, keepdims=True)
-            return (g1 * g2).sum(1)**2 / ( (g1**2).sum() * (g2**2).sum(1) )
+            if r2:
+                r = (g1 * g2).sum(1)**2 / ( (g1**2).sum() * (g2**2).sum(1) )
+            else:
+                r = (g1 * g2).sum(1) / np.sqrt( (g1**2).sum() * (g2**2).sum(1) )
         elif isinstance(id2, str):
             g1 = self.read_list(id1, dtype=dtype)
             g2 = self.read(id2, dtype=dtype)
             g1 -= g1.values.mean(1, keepdims=True)
             g2 -= g2.mean()
-            return (g1 * g2).sum(1)**2 / ( (g1**2).sum(1) * (g2**2).sum() )
+            if r2:
+                r = (g1 * g2).sum(1)**2 / ( (g1**2).sum(1) * (g2**2).sum() )
+            else:
+                r = (g1 * g2).sum(1) / np.sqrt( (g1**2).sum(1) * (g2**2).sum() )
         else:
             assert len(id1) == len(id2)
             g1 = self.read_list(id1, dtype=dtype).values
             g2 = self.read_list(id2, dtype=dtype).values
             g1 -= g1.mean(1, keepdims=True)
             g2 -= g2.mean(1, keepdims=True)
-            return (g1 * g2).sum(1) ** 2 / ( (g1**2).sum(1) * (g2**2).sum(1) )
+            if r2:
+                r = (g1 * g2).sum(1) ** 2 / ( (g1**2).sum(1) * (g2**2).sum(1) )
+            else:
+                r = (g1 * g2).sum(1) / np.sqrt( (g1**2).sum(1) * (g2**2).sum(1) )
+        return r
 
     def get_ld_matrix(self, variant_ids, dtype=np.float32):
         g = self.read_list(variant_ids, dtype=dtype).values
-        return np.corrcoef(g)
+        return pd.DataFrame(np.corrcoef(g), index=variant_ids, columns=variant_ids)
 
 
 def load_dosages_df(plink_prefix_path, select_samples=None):

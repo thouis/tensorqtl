@@ -5,8 +5,10 @@ import numpy as np
 from datetime import datetime
 import sys
 import os
+import re
 import pickle
 import argparse
+from collections import defaultdict
 
 sys.path.insert(1, os.path.dirname(__file__))
 from core import *
@@ -17,9 +19,10 @@ import genotypeio, cis, trans, susie
 def main():
     parser = argparse.ArgumentParser(description='tensorQTL: GPU-based QTL mapper')
     parser.add_argument('genotype_path', help='Genotypes in PLINK format')
-    parser.add_argument('phenotype_bed', help='Phenotypes in BED format')
+    parser.add_argument('phenotypes', help="Phenotypes in BED format (.bed, .bed.gz, .bed.parquet), or optionally for 'trans' mode, parquet or tab-delimited.")
     parser.add_argument('prefix', help='Prefix for output file names')
-    parser.add_argument('--mode', default='cis', choices=['cis', 'cis_nominal', 'cis_independent', 'cis_susie', 'trans'], help='Mapping mode. Default: cis')
+    parser.add_argument('--mode', type=str, default='cis', choices=['cis', 'cis_nominal', 'cis_independent', 'cis_susie', 'trans', 'trans_susie'],
+                        help='Mapping mode. Default: cis')
     parser.add_argument('--covariates', default=None, help='Covariates file, tab-delimited, covariates x samples')
     parser.add_argument('--paired_covariate', default=None, help='Single phenotype-specific covariate. Tab-delimited file, phenotypes x samples')
     parser.add_argument('--permutations', type=int, default=10000, help='Number of permutations. Default: 10000')
@@ -35,10 +38,12 @@ def main():
     parser.add_argument('--return_r2', action='store_true', help='Return r2 (only for sparse trans-QTL output)')
     parser.add_argument('--best_only', action='store_true', help='Only write lead association for each phenotype (interaction mode only)')
     parser.add_argument('--output_text', action='store_true', help='Write output in txt.gz format instead of parquet (trans-QTL mode only)')
-    parser.add_argument('--batch_size', type=int, default=20000, help='Batch size. Reduce this if encountering OOM errors.')
-    parser.add_argument('--load_split', action='store_true', help='Load genotypes into memory separately for each chromosome.')
+    parser.add_argument('--batch_size', type=int, default=20000, help='GPU batch size (trans-QTLs only). Reduce this if encountering OOM errors.')
+    parser.add_argument('--chunk_size', default=None, help="For cis-QTL mapping, load genotypes into CPU memory in chunks of chunk_size variants, or by chromosome if chunk_size is 'chr'.")
+    parser.add_argument('--susie_loci', default=None, help="Table (parquet or tsv) with loci to fine-map (phenotype_id, chr, pos) with mode 'trans_susie'.")
     parser.add_argument('--disable_beta_approx', action='store_true', help='Disable Beta-distribution approximation of empirical p-values (not recommended).')
     parser.add_argument('--warn_monomorphic', action='store_true', help='Warn if monomorphic variants are found.')
+    parser.add_argument('--max_effects', type=int, default=10, help='Maximum number of non-zero effects in the SuSiE regression model.')
     parser.add_argument('--fdr', default=0.05, type=np.float64, help='FDR for cis-QTLs')
     parser.add_argument('--qvalue_lambda', default=None, type=np.float64, help='lambda parameter for pi0est in qvalue.')
     parser.add_argument('--seed', default=None, type=int, help='Seed for permutations.')
@@ -62,12 +67,24 @@ def main():
         logger.write(f'  * using seed {args.seed}')
 
     # load inputs
-    logger.write(f'  * reading phenotypes ({args.phenotype_bed})')
-    phenotype_df, phenotype_pos_df = read_phenotype_bed(args.phenotype_bed)
-    if phenotype_pos_df.columns[1] == 'pos':
-        logger.write(f"  * cis-window detected as position ± {args.window:,}")
-    else:
-        logger.write(f"  * cis-window detected as [start - {args.window:,}, end + {args.window:,}]")
+    logger.write(f'  * reading phenotypes ({args.phenotypes})')
+    # for cis modes, require BED input with position information
+    if args.mode.startswith('cis'):
+        assert args.phenotypes.lower().endswith(('.bed', '.bed.gz', '.bed.parquet')), "For cis modes, phenotypes must be in BED format."
+        phenotype_df, phenotype_pos_df = read_phenotype_bed(args.phenotypes)
+        if phenotype_pos_df.columns[1] == 'pos':
+            logger.write(f"  * cis-window detected as position ± {args.window:,}")
+        else:
+            logger.write(f"  * cis-window detected as [start - {args.window:,}, end + {args.window:,}]")
+    elif args.mode.startswith('trans'):
+        if args.phenotypes.lower().endswith(('.bed', '.bed.gz', '.bed.parquet')):
+            phenotype_df, phenotype_pos_df = read_phenotype_bed(args.phenotypes)
+        else:
+            if args.phenotypes.endswith('.parquet'):
+                phenotype_df = pd.read_parquet(args.phenotypes)
+            else:  # assume tab-delimited
+                phenotype_df = pd.read_csv(args.phenotypes, sep='\t', index_col=0)
+            phenotype_pos_df = None
 
     if args.covariates is not None:
         logger.write(f'  * reading covariates ({args.covariates})')
@@ -124,81 +141,155 @@ def main():
         group_s = None
 
     # load genotypes
-    if not args.load_split or args.mode != 'cis_nominal':  # load all genotypes into memory
+    if args.chunk_size is None:  # load all genotypes into memory
         logger.write(f'  * loading genotype dosages' if args.dosages else f'  * loading genotypes')
         genotype_df, variant_df = genotypeio.load_genotypes(args.genotype_path, select_samples=phenotype_df.columns, dosages=args.dosages)
         if variant_df is None:
             assert not args.mode.startswith('cis'), f"Genotype data without variant positions is only supported for mode='trans'."
+    else:
+        if not all([os.path.exists(f"{args.genotype_path}.{ext}") for ext in ['pgen', 'psam', 'pvar']]):
+            raise ValueError("Processing in chunks requires PLINK 2 pgen/psam/pvar files.")
+        import pgen
+        pgr = pgen.PgenReader(args.genotype_path, select_samples=phenotype_df.columns)
 
-    if args.mode.startswith('cis'):
-        if args.mode == 'cis':
+    if args.mode == 'cis':
+        if args.chunk_size is None:
             res_df = cis.map_cis(genotype_df, variant_df, phenotype_df, phenotype_pos_df, covariates_df=covariates_df,
                                  group_s=group_s, paired_covariate_df=paired_covariate_df, nperm=args.permutations,
                                  window=args.window, beta_approx=not args.disable_beta_approx, maf_threshold=maf_threshold,
                                  warn_monomorphic=args.warn_monomorphic, logger=logger, seed=args.seed, verbose=True)
-            logger.write('  * writing output')
-            if has_rpy2:
-                calculate_qvalues(res_df, fdr=args.fdr, qvalue_lambda=args.qvalue_lambda, logger=logger)
-            out_file = os.path.join(args.output_dir, f'{args.prefix}.cis_qtl.txt.gz')
-            res_df.to_csv(out_file, sep='\t', float_format='%.6g')
-        elif args.mode == 'cis_nominal':
-            if not args.load_split:
-                cis.map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, args.prefix, covariates_df=covariates_df,
+        else:
+            res_df = []
+            for gt_df, var_df, p_df, p_pos_df, _ in genotypeio.generate_paired_chunks(pgr, phenotype_df, phenotype_pos_df, args.chunk_size,
+                                                                                   dosages=args.dosages, verbose=True):
+                res_df.append(cis.map_cis(gt_df, var_df, p_df, p_pos_df, covariates_df=covariates_df,
+                                          group_s=group_s, paired_covariate_df=paired_covariate_df, nperm=args.permutations,
+                                          window=args.window, beta_approx=not args.disable_beta_approx, maf_threshold=maf_threshold,
+                                          warn_monomorphic=args.warn_monomorphic, logger=logger, seed=args.seed, verbose=True))
+            res_df = pd.concat(res_df)
+        logger.write('  * writing output')
+        if has_rpy2:
+            calculate_qvalues(res_df, fdr=args.fdr, qvalue_lambda=args.qvalue_lambda, logger=logger)
+        out_file = os.path.join(args.output_dir, f'{args.prefix}.cis_qtl.txt.gz')
+        res_df.to_csv(out_file, sep='\t', float_format='%.6g')
+
+    elif args.mode == 'cis_nominal':
+        if args.chunk_size is None:
+            cis.map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, args.prefix, covariates_df=covariates_df,
+                            paired_covariate_df=paired_covariate_df, interaction_df=interaction_df,
+                            maf_threshold_interaction=args.maf_threshold_interaction,
+                            group_s=None, window=args.window, maf_threshold=maf_threshold, run_eigenmt=True,
+                            output_dir=args.output_dir, write_top=True, write_stats=not args.best_only, logger=logger, verbose=True)
+            # compute significant pairs
+            if args.cis_output is not None:
+                cis_df = pd.read_csv(args.cis_output, sep='\t', index_col=0)
+                nominal_prefix = os.path.join(args.output_dir, f'{args.prefix}.cis_qtl_pairs')
+                signif_df = get_significant_pairs(cis_df, nominal_prefix, group_s=group_s, fdr=args.fdr)
+                signif_df.to_parquet(os.path.join(args.output_dir, f'{args.prefix}.cis_qtl.signif_pairs.parquet'))
+
+        else:
+            chunks = []
+            for gt_df, var_df, p_df, p_pos_df, ci in genotypeio.generate_paired_chunks(pgr, phenotype_df, phenotype_pos_df, args.chunk_size,
+                                                                                       dosages=args.dosages, verbose=True):
+                prefix = f"{args.prefix}.chunk{ci+1}"
+                chunks.append(prefix)
+                cis.map_nominal(gt_df, var_df, p_df, p_pos_df, prefix, covariates_df=covariates_df,
                                 paired_covariate_df=paired_covariate_df, interaction_df=interaction_df,
                                 maf_threshold_interaction=args.maf_threshold_interaction,
                                 group_s=None, window=args.window, maf_threshold=maf_threshold, run_eigenmt=True,
                                 output_dir=args.output_dir, write_top=True, write_stats=not args.best_only, logger=logger, verbose=True)
-                # compute significant pairs
-                if args.cis_output is not None:
-                    cis_df = pd.read_csv(args.cis_output, sep='\t', index_col=0)
-                    nominal_prefix = os.path.join(args.output_dir, f'{args.prefix}.cis_qtl_pairs')
-                    signif_df = get_significant_pairs(cis_df, nominal_prefix, group_s=group_s, fdr=args.fdr)
-                    signif_df.to_parquet(os.path.join(args.output_dir, f'{args.prefix}.cis_qtl.signif_pairs.parquet'))
+            chunk_files = glob.glob(os.path.join(args.output_dir, f"{args.prefix}.chunk*.cis_qtl_pairs.*.parquet"))
+            if args.chunk_size == 'chr':  # remove redundant chunk ID from file names
+                for f in chunk_files:
+                    x = re.findall(f"{args.prefix}\.(chunk\d+)", os.path.basename(f))
+                    assert len(x) == 1
+                    os.rename(f, f.replace(f"{x[0]}.", ""))
+            else:  # concatenate outputs by chromosome
+                chunk_df = pd.DataFrame({
+                    'file': chunk_files,
+                    'chunk': [int(re.findall(f"{args.prefix}\.chunk(\d+)", os.path.basename(i))[0]) for i in chunk_files],
+                    'chr': [re.findall("\.cis_qtl_pairs\.(.*)\.parquet", os.path.basename(i))[0] for i in chunk_files],
+                }).sort_values('chunk')
+                for chrom, chr_df in chunk_df.groupby('chr', sort=False):
+                    print(f"\rConcatenating outputs for {chrom}", end='' if chrom != chunk_df['chr'].iloc[-1] else None)
+                    pd.concat([pd.read_parquet(f) for f in chr_df['file']]).reset_index(drop=True).to_parquet(
+                        os.path.join(args.output_dir, f"{args.prefix}.cis_qtl_pairs.{chrom}.parquet"))
+                    for f in chr_df['file']:
+                        os.remove(f)
+            # concatenate interaction results
+            if interaction_df is not None:
+                chunk_files = [os.path.join(args.output_dir, f"{c}.cis_qtl_top_assoc.txt.gz") for c in chunks]
+                pd.concat([pd.read_csv(f, sep='\t', index_col=0, dtype=str) for f in chunk_files]).to_csv(
+                    os.path.join(args.output_dir, f"{args.prefix}.cis_qtl_top_assoc.txt.gz"), sep='\t')
+                for f in chunk_files:
+                    os.remove(f)
 
-            else:  # load genotypes for each chromosome separately
-                # currently only supports PLINK1.9 inputs, TODO
-                pr = genotypeio.PlinkReader(args.genotype_path, select_samples=phenotype_df.columns, dtype=np.int8)
-                top_df = []
-                for chrom in pr.chrs:
-                    g, pos_s = pr.get_region(chrom)
-                    genotype_df = pd.DataFrame(g, index=pos_s.index, columns=pr.fam['iid'])[phenotype_df.columns]
-                    variant_df = pr.bim.set_index('snp')[['chrom', 'pos']]
-                    chr_df = cis.map_nominal(genotype_df, variant_df[variant_df['chrom'] == chrom],
-                                             phenotype_df[phenotype_pos_df['chr'] == chrom], phenotype_pos_df[phenotype_pos_df['chr'] == chrom],
-                                             args.prefix, covariates_df=covariates_df, paired_covariate_df=paired_covariate_df,
-                                             interaction_df=interaction_df, maf_threshold_interaction=args.maf_threshold_interaction,
-                                             group_s=None, window=args.window, maf_threshold=maf_threshold, run_eigenmt=True,
-                                             output_dir=args.output_dir, write_top=True, write_stats=not args.best_only, logger=logger, verbose=True)
-                    top_df.append(chr_df)
-                if interaction_df is not None:
-                    top_df = pd.concat(top_df)
-                    top_df.to_csv(os.path.join(args.output_dir, f'{args.prefix}.cis_qtl_top_assoc.txt.gz'),
-                                  sep='\t', float_format='%.6g')
-
-        elif args.mode == 'cis_independent':
-            summary_df = pd.read_csv(args.cis_output, sep='\t', index_col=0)
-            summary_df.rename(columns={'minor_allele_samples':'ma_samples', 'minor_allele_count':'ma_count'}, inplace=True)
+    elif args.mode == 'cis_independent':
+        summary_df = pd.read_csv(args.cis_output, sep='\t', index_col=0)
+        summary_df.rename(columns={'minor_allele_samples':'ma_samples', 'minor_allele_count':'ma_count'}, inplace=True)
+        if args.chunk_size is None:
             res_df = cis.map_independent(genotype_df, variant_df, summary_df, phenotype_df, phenotype_pos_df, covariates_df,
                                          group_s=group_s, fdr=args.fdr, nperm=args.permutations, window=args.window,
                                          maf_threshold=maf_threshold, logger=logger, seed=args.seed, verbose=True)
-            logger.write('  * writing output')
-            out_file = os.path.join(args.output_dir, f'{args.prefix}.cis_independent_qtl.txt.gz')
-            res_df.to_csv(out_file, sep='\t', index=False, float_format='%.6g')
+        else:
+            res_df = []
+            for gt_df, var_df, p_df, p_pos_df, _ in genotypeio.generate_paired_chunks(pgr, phenotype_df, phenotype_pos_df, args.chunk_size,
+                                                                                      dosages=args.dosages, verbose=True):
+                res_df.append(cis.map_independent(gt_df, var_df, summary_df, p_df, p_pos_df, covariates_df,
+                                                  group_s=group_s, fdr=args.fdr, nperm=args.permutations, window=args.window,
+                                                  maf_threshold=maf_threshold, logger=logger, seed=args.seed, verbose=True))
+            res_df = pd.concat(res_df).reset_index(drop=True)
+        logger.write('  * writing output')
+        out_file = os.path.join(args.output_dir, f'{args.prefix}.cis_independent_qtl.txt.gz')
+        res_df.to_csv(out_file, sep='\t', index=False, float_format='%.6g')
 
-        elif args.mode == 'cis_susie':
-            if args.cis_output.endswith('.parquet'):
-                signif_df = pd.read_parquet(args.cis_output)
-            else:
-                signif_df = pd.read_csv(args.cis_output, sep='\t')
-            if 'qval' in signif_df:  # otherwise input is from get_significant_pairs
-                signif_df = signif_df[signif_df['qval'] <= args.fdr]
-            ix = phenotype_df.index[phenotype_df.index.isin(signif_df['phenotype_id'].unique())]
-            summary_df, res = susie.map(genotype_df, variant_df, phenotype_df.loc[ix], phenotype_pos_df.loc[ix],
-                                        covariates_df, paired_covariate_df=paired_covariate_df, maf_threshold=maf_threshold,
-                                        max_iter=500, window=args.window, summary_only=False)
-            summary_df.to_parquet(os.path.join(args.output_dir, f'{args.prefix}.SuSiE_summary.parquet'))
-            with open(os.path.join(args.output_dir, f'{args.prefix}.SuSiE.pickle'), 'wb') as f:
-                pickle.dump(res, f)
+    elif args.mode == 'cis_susie':
+        if args.cis_output.endswith('.parquet'):
+            signif_df = pd.read_parquet(args.cis_output)
+        else:
+            signif_df = pd.read_csv(args.cis_output, sep='\t')
+        if 'qval' in signif_df:  # otherwise input is from get_significant_pairs
+            signif_df = signif_df[signif_df['qval'] <= args.fdr]
+        phenotype_ids = phenotype_df.index[phenotype_df.index.isin(signif_df['phenotype_id'].unique())]
+        phenotype_df = phenotype_df.loc[phenotype_ids]
+        phenotype_pos_df = phenotype_pos_df.loc[phenotype_ids]
+        if args.chunk_size is None:
+            summary_df, res = susie.map(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
+                                        covariates_df, paired_covariate_df=paired_covariate_df, L=args.max_effects,
+                                        maf_threshold=maf_threshold, max_iter=500, window=args.window, summary_only=False)
+        else:
+            summary_df = []
+            res = {}
+            for gt_df, var_df, p_df, p_pos_df, _ in genotypeio.generate_paired_chunks(pgr, phenotype_df, phenotype_pos_df, args.chunk_size,
+                                                                                      dosages=args.dosages, verbose=True):
+                chunk_summary_df, chunk_res = susie.map(gt_df, var_df, p_df, p_pos_df,
+                                                        covariates_df, paired_covariate_df=paired_covariate_df, L=args.max_effects,
+                                                        maf_threshold=maf_threshold, max_iter=500, window=args.window, summary_only=False)
+                summary_df.append(chunk_summary_df)
+                res |= chunk_res
+            summary_df = pd.concat(summary_df).reset_index(drop=True)
+
+        summary_df.to_parquet(os.path.join(args.output_dir, f'{args.prefix}.SuSiE_summary.parquet'))
+        with open(os.path.join(args.output_dir, f'{args.prefix}.SuSiE.pickle'), 'wb') as f:
+            pickle.dump(res, f)
+
+    elif args.mode == 'trans_susie':
+        assert args.susie_loci is not None
+        if args.susie_loci.endswith('.parquet'):
+            locus_df = pd.read_parquet(args.susie_loci)
+        else:
+            locus_df = pd.read_csv(args.susie_loci, sep='\t')
+        locus_df.rename(columns={'position':'pos'}, inplace=True)
+        if args.chunk_size is None:
+            assert variant_df is not None
+            summary_df, res = susie.map_loci(locus_df, genotype_df, variant_df, phenotype_df, covariates_df,
+                                             maf_threshold=maf_threshold, max_iter=500, window=args.window)
+        else:
+            raise NotImplementedError()
+
+        summary_df.to_parquet(os.path.join(args.output_dir, f'{args.prefix}.SuSiE_summary.parquet'))
+        with open(os.path.join(args.output_dir, f'{args.prefix}.SuSiE.pickle'), 'wb') as f:
+            pickle.dump(res, f)
 
     elif args.mode == 'trans':
         return_sparse = not args.return_dense
@@ -213,21 +304,51 @@ def main():
             else:
                 interaction_df = interaction_df.squeeze('columns')
 
-        pairs_df = trans.map_trans(genotype_df, phenotype_df, covariates_df=covariates_df, interaction_s=interaction_df,
-                                  return_sparse=return_sparse, pval_threshold=pval_threshold,
-                                  maf_threshold=maf_threshold, batch_size=args.batch_size,
-                                  return_r2=args.return_r2, logger=logger)
-
-        if variant_df is not None:
-            logger.write('  * filtering out cis-QTLs (within +/-5Mb)')
-            pairs_df = trans.filter_cis(pairs_df, phenotype_pos_df, variant_df, window=5000000)
-
-        logger.write('  * writing output')
-        if not args.output_text:
-            pairs_df.to_parquet(os.path.join(args.output_dir, f'{args.prefix}.trans_qtl_pairs.parquet'))
+        if args.chunk_size is None:
+            pairs_df = trans.map_trans(genotype_df, phenotype_df, covariates_df=covariates_df, interaction_s=interaction_df,
+                                       return_sparse=return_sparse, pval_threshold=pval_threshold,
+                                       maf_threshold=maf_threshold, batch_size=args.batch_size,
+                                       return_r2=args.return_r2, logger=logger)
+            if args.return_dense:
+                pval_df, b_df, b_se_df, af_s = pairs_df
         else:
-            out_file = os.path.join(args.output_dir, f'{args.prefix}.trans_qtl_pairs.txt.gz')
-            pairs_df.to_csv(out_file, sep='\t', index=False, float_format='%.6g')
+            pairs_df = []
+            n, rem = np.divmod(pgr.num_variants, int(args.chunk_size))
+            bounds = [0] + n * [int(args.chunk_size)]
+            if rem != 0:
+                bounds.append(rem)
+            bounds = np.cumsum(bounds)
+            nchunks = len(bounds)-1
+            for i in range(nchunks):
+                print(f"Processing genotype chunk {i+1}/{nchunks}")
+                if args.dosages:
+                    gt_df = pgr.read_dosages_range(bounds[i], bounds[i+1]-1, dtype=np.float32)
+                else:
+                    gt_df = pgr.read_range(bounds[i], bounds[i+1]-1, impute_mean=False, dtype=np.int8)
+                pairs_df.append(trans.map_trans(gt_df, phenotype_df, covariates_df=covariates_df, interaction_s=interaction_df,
+                                                return_sparse=return_sparse, pval_threshold=pval_threshold,
+                                                maf_threshold=maf_threshold, batch_size=args.batch_size,
+                                                return_r2=args.return_r2, logger=logger))
+            pairs_df = pd.concat(pairs_df).reset_index(drop=True)
+            variant_df = pgr.variant_df
+
+        if return_sparse:
+            if variant_df is not None and phenotype_pos_df is not None:
+                logger.write('  * filtering out cis-QTLs (within +/-5Mb)')
+                pairs_df = trans.filter_cis(pairs_df, phenotype_pos_df, variant_df, window=5000000)
+
+            logger.write('  * writing sparse output')
+            if not args.output_text:
+                pairs_df.to_parquet(os.path.join(args.output_dir, f'{args.prefix}.trans_qtl_pairs.parquet'))
+            else:
+                out_file = os.path.join(args.output_dir, f'{args.prefix}.trans_qtl_pairs.txt.gz')
+                pairs_df.to_csv(out_file, sep='\t', index=False, float_format='%.6g')
+        else:
+            logger.write('  * writing dense output')
+            pval_df.to_parquet(os.path.join(args.output_dir, f'{args.prefix}.trans_qtl_pval.parquet'))
+            b_df.to_parquet(os.path.join(args.output_dir, f'{args.prefix}.trans_qtl_beta.parquet'))
+            b_se_df.to_parquet(os.path.join(args.output_dir, f'{args.prefix}.trans_qtl_beta_se.parquet'))
+            af_s.to_frame().to_parquet(os.path.join(args.output_dir, f'{args.prefix}.trans_qtl_af.parquet'))
 
     logger.write(f'[{datetime.now().strftime("%b %d %H:%M:%S")}] Finished mapping')
 

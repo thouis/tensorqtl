@@ -109,14 +109,14 @@ def filter_maf_interaction(genotypes_t, interaction_mask_t=None, maf_threshold_i
     return genotypes_t, mask_t
 
 
-def impute_mean(genotypes_t):
+def impute_mean(genotypes_t, missing=-9):
     """Impute missing genotypes to mean"""
-    m = genotypes_t == -1
+    m = genotypes_t == missing
     ix = torch.nonzero(m, as_tuple=True)[0]
     if len(ix) > 0:
         a = genotypes_t.sum(1)
         b = m.sum(1).float()
-        mu = (a + b) / (genotypes_t.shape[1] - b)
+        mu = (a - missing*b) / (genotypes_t.shape[1] - b)
         genotypes_t[m] = mu[ix]
 
 
@@ -370,9 +370,9 @@ def calculate_beta_approx_pval(r2_perm, r2_nominal, dof_init, tol=1e-4):
 
 def read_phenotype_bed(phenotype_bed):
     """Load phenotype BED file as phenotype and position DataFrames"""
-    if phenotype_bed.endswith(('.bed.gz', '.bed')):
+    if phenotype_bed.lower().endswith(('.bed.gz', '.bed')):
         phenotype_df = pd.read_csv(phenotype_bed, sep='\t', index_col=3, dtype={'#chr':str, '#Chr':str})
-    elif phenotype_bed.endswith('.parquet'):
+    elif phenotype_bed.lower().endswith('.bed.parquet'):
         phenotype_df = pd.read_parquet(phenotype_bed)
         phenotype_df.set_index(phenotype_df.columns[3], inplace=True)
     else:
