@@ -634,6 +634,10 @@ def map_cis(genotype_df, variant_df, phenotype_df, phenotype_pos_df, covariates_
     if logger is None:
         logger = SimpleLogger()
 
+    # verify indices
+    assert (len(phenotype_df) == len(phenotype_pos_df)) and \
+        (phenotype_df.index == phenotype_pos_df.index).all(), 'phenotype index not identical to phenotype positions index'
+
     logger.write('cis-QTL mapping: empirical p-values for phenotypes')
     logger.write(f'  * {phenotype_df.shape[1]} samples')
     logger.write(f'  * {phenotype_df.shape[0]} phenotypes')
